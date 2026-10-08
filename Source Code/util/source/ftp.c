@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <stdbool.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/stat.h>
 #include "common_utils.h"
 #include <unistd.h>
@@ -42,6 +43,8 @@ int sceNetCtlGetInfo(int size, SceNetCtlInfo *info);
 #define CMD_LINE_BUF_SIZE PATH_MAX + 255
 #define CRLF "\r\n"
 #define FILE_BUF_SIZE 8192
+#define UPLOAD_BUF_SIZE (1024 * 1024)
+#define DATA_SOCK_BUF_SIZE (1024 * 1024)
 #define DEFAULT_PATH "/"
 #define DEFAULT_PORT 1337
 #define SCE_NET_SOCKET_ABORT_FLAG_RCV_PRESERVATION 0x00000001
@@ -989,11 +992,201 @@ static int dir_up(struct client_info *client) {
 #endif
 }
 
+// Enlarges a data socket's send and receive buffers and disables Nagle's
+// algorithm. The receive buffer bounds the TCP window the server can
+// advertise, which limits upload throughput. The kernel may grant less than
+// requested (it halves 1 MB to 512 KB here). Failures are ignored: defaults
+// still work.
+static void tune_data_socket(int sockfd) {
+  int bufsize = DATA_SOCK_BUF_SIZE;
+  int on = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+  setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+}
+
+// Outcome of one upload's receive/write phase.
+struct upload_result {
+  int n_received;    // 0 = clean end of stream, < 0 = receive error.
+  int recv_errno;    // errno from the failing recv(), if any.
+  bool write_failed; // A write() to the file failed or came up short.
+};
+
+// Fixed-size ring of upload buffers shared by the receiver (the client
+// thread) and one writer thread. The receiver only fills slots that are not
+// queued, and the writer only reads queued slots, so the data itself needs no
+// locking; the mutex guards the indices and flags.
+#define UPLOAD_RING_SLOTS 4
+
+struct upload_ring {
+  int fd;
+  unsigned char *slot[UPLOAD_RING_SLOTS];
+  size_t len[UPLOAD_RING_SLOTS];
+  int head;   // Next slot the receiver fills.
+  int tail;   // Next slot the writer drains.
+  int count;  // Filled slots waiting for the writer.
+  bool done;  // Receiver has queued its last slot.
+  bool error; // A write failed; remaining slots are drained, not written.
+  pthread_mutex_t mtx;
+  pthread_cond_t not_empty, not_full;
+};
+
+static void *upload_writer(void *arg) {
+  struct upload_ring *r = (struct upload_ring *)arg;
+  for (;;) {
+    pthread_mutex_lock(&r->mtx);
+    while (r->count == 0 && !r->done)
+      pthread_cond_wait(&r->not_empty, &r->mtx);
+    if (r->count == 0) { // Done and fully drained.
+      pthread_mutex_unlock(&r->mtx);
+      return NULL;
+    }
+    int i = r->tail;
+    size_t n = r->len[i];
+    bool failed = r->error;
+    pthread_mutex_unlock(&r->mtx);
+
+    bool ok = true;
+    if (!failed)
+      ok = (write(r->fd, r->slot[i], n) == (ssize_t)n);
+
+    pthread_mutex_lock(&r->mtx);
+    if (!ok)
+      r->error = true;
+    r->tail = (r->tail + 1) % UPLOAD_RING_SLOTS;
+    r->count--;
+    pthread_cond_signal(&r->not_full);
+    pthread_mutex_unlock(&r->mtx);
+  }
+}
+
+// Fills buf (up to size bytes) from the socket. Returns the byte count and
+// leaves res->n_received at the last recv() result: <= 0 means the stream
+// ended or failed, and the returned count may be a short final block.
+static size_t fill_from_socket(int sockfd, unsigned char *buf, size_t size,
+                               struct upload_result *res) {
+  size_t filled = 0;
+  while (filled < size) {
+    res->n_received = recv(sockfd, buf + filled, size - filled, 0);
+    if (res->n_received <= 0) {
+      res->recv_errno = errno; // Capture before any other call changes it.
+      break;
+    }
+    filled += (size_t)res->n_received;
+  }
+  return filled;
+}
+
+// Receives the stream with a dedicated writer thread so reading the socket
+// and writing the file overlap. Returns false, having consumed no data, if
+// the buffers or thread could not be set up; the caller then falls back to
+// recv_file_serial().
+static bool recv_file_pipelined(int sockfd, int fd,
+                                struct upload_result *res) {
+  struct upload_ring *r = (struct upload_ring *)calloc(1, sizeof(*r));
+  if (r == NULL)
+    return false;
+  r->fd = fd;
+
+  int slots = 0;
+  while (slots < UPLOAD_RING_SLOTS) {
+    r->slot[slots] = (unsigned char *)malloc(UPLOAD_BUF_SIZE);
+    if (r->slot[slots] == NULL)
+      break;
+    slots++;
+  }
+
+  bool have_mtx = false, have_ne = false, have_nf = false;
+  pthread_t writer;
+  bool started = false;
+  if (slots == UPLOAD_RING_SLOTS &&
+      (have_mtx = (pthread_mutex_init(&r->mtx, NULL) == 0)) &&
+      (have_ne = (pthread_cond_init(&r->not_empty, NULL) == 0)) &&
+      (have_nf = (pthread_cond_init(&r->not_full, NULL) == 0)))
+    started = (pthread_create(&writer, NULL, upload_writer, r) == 0);
+
+  if (!started) {
+    if (have_nf)
+      pthread_cond_destroy(&r->not_full);
+    if (have_ne)
+      pthread_cond_destroy(&r->not_empty);
+    if (have_mtx)
+      pthread_mutex_destroy(&r->mtx);
+    for (int i = 0; i < slots; i++)
+      free(r->slot[i]);
+    free(r);
+    return false;
+  }
+
+  res->n_received = 1; // > 0 while the stream is still open.
+  while (res->n_received > 0) {
+    // Wait for a slot the writer has released.
+    pthread_mutex_lock(&r->mtx);
+    while (r->count == UPLOAD_RING_SLOTS)
+      pthread_cond_wait(&r->not_full, &r->mtx);
+    bool failed = r->error;
+    int h = r->head;
+    pthread_mutex_unlock(&r->mtx);
+    if (failed)
+      break;
+
+    size_t filled = fill_from_socket(sockfd, r->slot[h], UPLOAD_BUF_SIZE, res);
+    if (filled > 0) {
+      pthread_mutex_lock(&r->mtx);
+      r->len[h] = filled;
+      r->head = (h + 1) % UPLOAD_RING_SLOTS;
+      r->count++;
+      pthread_cond_signal(&r->not_empty);
+      pthread_mutex_unlock(&r->mtx);
+    }
+  }
+
+  // Let the writer drain what is queued, then stop it.
+  pthread_mutex_lock(&r->mtx);
+  r->done = true;
+  pthread_cond_signal(&r->not_empty);
+  pthread_mutex_unlock(&r->mtx);
+  pthread_join(writer, NULL);
+
+  res->write_failed = r->error;
+
+  pthread_cond_destroy(&r->not_full);
+  pthread_cond_destroy(&r->not_empty);
+  pthread_mutex_destroy(&r->mtx);
+  for (int i = 0; i < UPLOAD_RING_SLOTS; i++)
+    free(r->slot[i]);
+  free(r);
+  return true;
+}
+
+// Fallback: receive and write on the calling thread, one block at a time.
+static void recv_file_serial(int sockfd, int fd, struct upload_result *res) {
+  unsigned char small_buffer[FILE_BUF_SIZE];
+  unsigned char *buffer = (unsigned char *)malloc(UPLOAD_BUF_SIZE);
+  size_t buffer_size = UPLOAD_BUF_SIZE;
+  if (buffer == NULL) {
+    buffer = small_buffer;
+    buffer_size = sizeof(small_buffer);
+  }
+
+  res->n_received = 1; // > 0 while the stream is still open.
+  while (res->n_received > 0) {
+    size_t filled = fill_from_socket(sockfd, buffer, buffer_size, res);
+    if (filled > 0 && write(fd, buffer, filled) != (ssize_t)filled) {
+      res->write_failed = true;
+      break;
+    }
+  }
+
+  if (buffer != small_buffer)
+    free(buffer);
+}
+
 // Receives a file from the client and stores it on the server.
 // Used in FTP commands APPE and STOR.
 static void recv_file(struct client_info *client, const char *path) {
   // Set file flags for open().
-  int flags = O_CREAT | O_RDWR; // Create file if necessary, open in r/w mode.
+  int flags = O_CREAT | O_WRONLY; // Create file if necessary, open write-only.
   if (client->restore_point == -1)
     flags = flags | O_APPEND; // Append new data to the end of the file.
   else if (client->restore_point == 0)
@@ -1035,27 +1228,25 @@ static void recv_file(struct client_info *client, const char *path) {
     sockfd = client->data_sockfd;
   else
     sockfd = client->pasv_sockfd;
-  unsigned char buffer[FILE_BUF_SIZE];
-  int n_received;
-  int n_written;
-  while ((n_received = recv(sockfd, buffer, sizeof(buffer), 0)) > 0) {
-    if ((n_written = write(fd, buffer, n_received)) != n_received) {
-      debug_retval(n_written);
-      close(fd);
-      close_data_connection(client);
-      send_ctrl_msg(client, RC_451);
-      return;
-    }
-  }
+  tune_data_socket(sockfd);
+
+  // Receive the data and write it to the file. A writer thread overlaps the
+  // two; if it cannot be set up, do both one after the other on this thread.
+  struct upload_result res;
+  memset(&res, 0, sizeof(res));
+  if (!recv_file_pipelined(sockfd, fd, &res))
+    recv_file_serial(sockfd, fd, &res);
 
   close(fd);
   close_data_connection(client);
 
-  if (n_received == 0) { // Success.
+  if (res.write_failed) {
+    send_ctrl_msg(client, RC_451);
+  } else if (res.n_received == 0) { // Success.
     send_ctrl_msg(client, RC_226);
   } else {
-    debug_retval(n_received);
-    if (errno == 28)
+    debug_retval(res.n_received);
+    if (res.recv_errno == 28)
       send_ctrl_msg(client, RC_452);
     else
       send_ctrl_msg(client, RC_426);
@@ -1614,6 +1805,8 @@ static void cmd_PASV(struct client_info *client) {
     send_ctrl_msg(client, RC_451);
     return;
   }
+  // Set on the listener so the accepted connection inherits the options.
+  tune_data_socket(client->data_sockfd);
 
   int ret;
   socklen_t socklen = sizeof(struct sockaddr_in);
@@ -1682,6 +1875,7 @@ static void cmd_PORT(struct client_info *client) {
           data_ip[3]);
   inet_pton(AF_INET, ip_str, &data_addr);
   client->data_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  tune_data_socket(client->data_sockfd);
 
 #ifdef PS4
   client->data_sockaddr.sin_len = sizeof(client->data_sockaddr);
